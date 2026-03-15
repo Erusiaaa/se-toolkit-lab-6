@@ -55,14 +55,14 @@ def call_llm(question: str, settings: AgentSettings) -> str:
     Call the LLM API with the user's question.
 
     Args:
-        question: The user's question
-        settings: Agent settings with API credentials
+        question: The user's question.
+        settings: Agent settings with API credentials.
 
     Returns:
-        The LLM's answer as a string
+        The LLM's answer as a string.
 
     Raises:
-        SystemExit: On API errors or timeouts
+        SystemExit: On API errors or timeouts.
     """
     url = f"{settings.llm_api_base}/chat/completions"
     headers = {
