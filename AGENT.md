@@ -278,6 +278,8 @@ project-root/
 
 ## Troubleshooting
 
+> **Tip:** If you encounter issues, check that your VM is running and the Qwen Code API is accessible.
+
 ### "Connection refused" error
 - Check that your VM is running and accessible
 - Verify the IP address and port in `LLM_API_BASE`
