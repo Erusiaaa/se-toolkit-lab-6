@@ -104,7 +104,7 @@ The agent follows an iterative loop:
 
 ### Tools
 
-The agent has two tools registered as function-calling schemas:
+The agent has **three** tools registered as function-calling schemas:
 
 #### `read_file`
 
@@ -132,6 +132,34 @@ List files and directories at the given path.
 **Security:**
 - Validates path is within project directory
 - Blocks `..` traversal attempts
+
+#### `query_api` (Task 3)
+
+Send an HTTP request to the backend LMS API. Use this to query live data (e.g., item count, completion rates, top learners) or check API behavior (status codes, error responses).
+
+**Parameters:**
+- `method` (string): HTTP method — GET, POST, PUT, DELETE, etc.
+- `path` (string): API endpoint path (e.g., `/items/`, `/analytics/completion-rate`)
+- `body` (string, optional): JSON request body for POST/PUT requests
+
+**Returns:** JSON string with `status_code` and `body` fields.
+
+**Authentication:**
+- Uses `LMS_API_KEY` from `.env.docker.secret`
+- Sends as `Authorization: Bearer <LMS_API_KEY>` header
+
+**Environment Variables:**
+- `AGENT_API_BASE_URL`: Backend base URL (default: `http://localhost:42002`)
+- `LMS_API_KEY`: Backend API authentication key
+
+**Example:**
+```json
+{
+  "tool": "query_api",
+  "args": {"method": "GET", "path": "/items/"},
+  "result": "{\"status_code\": 200, \"body\": \"[]\"}"
+}
+```
 
 ### Path Security
 
@@ -235,11 +263,15 @@ pytest tests/ -v
 
 ## Environment Variables
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `LLM_API_KEY` | Your Qwen Code API key | `your-api-key` |
-| `LLM_API_BASE` | API base URL | `http://10.93.25.146:8000/v1` |
-| `LLM_MODEL` | Model name | `qwen3-coder-plus` |
+| Variable | Source | Description | Example |
+|----------|--------|-------------|---------|
+| `LLM_API_KEY` | `.env.agent.secret` | Your Qwen Code API key | `your-api-key` |
+| `LLM_API_BASE` | `.env.agent.secret` | API base URL | `http://10.93.25.146:8000/v1` |
+| `LLM_MODEL` | `.env.agent.secret` | Model name | `qwen3-coder-plus` |
+| `LMS_API_KEY` | `.env.docker.secret` | Backend API authentication key for `query_api` | `13` |
+| `AGENT_API_BASE_URL` | Environment (optional) | Backend base URL for `query_api` (default: `http://localhost:42002`) | `http://localhost:42002` |
+
+**Important:** The agent reads all configuration from environment variables, not hardcoded values. The autochecker injects different values during evaluation.
 
 ## Error Handling
 
@@ -247,12 +279,14 @@ pytest tests/ -v
 |-------|----------|
 | Missing `.env.agent.secret` | Exit with error message to stderr |
 | Missing API key | Exit with error message to stderr |
+| Missing `LMS_API_KEY` | Warning printed to stderr, `query_api` will fail |
 | Network timeout (>60s) | Exit with timeout error |
 | HTTP error (4xx, 5xx) | Print status code and response to stderr |
 | Invalid API response | Print parsing error to stderr |
 | Path traversal attempt | Return "Access denied" as tool result |
 | File not found | Return "File not found" as tool result |
 | Max 10 tool calls | Stop loop, return partial answer |
+| Backend connection failed | Return error JSON from `query_api` |
 
 ## Dependencies
 
@@ -267,14 +301,46 @@ project-root/
 ├── agent.py              # Main CLI script
 ├── .env.agent.secret     # LLM credentials (gitignored)
 ├── .env.agent.example    # Example environment file
+├── .env.docker.secret    # Backend API key (gitignored)
 ├── AGENT.md              # This documentation
 ├── plans/
 │   ├── task-1.md         # Task 1 implementation plan
-│   └── task-2.md         # Task 2 implementation plan
+│   ├── task-2.md         # Task 2 implementation plan
+│   └── task-3.md         # Task 3 implementation plan
 └── tests/
     ├── test_task1_agent.py  # Task 1 regression test
-    └── test_task2_agent.py  # Task 2 regression tests
+    ├── test_task2_agent.py  # Task 2 regression tests
+    └── test_task3_agent.py  # Task 3 regression tests
 ```
+
+## Task 3: Lessons Learned
+
+### Adding the `query_api` Tool
+
+The main challenge in Task 3 was integrating a new tool that communicates with an external HTTP API while maintaining the existing agentic loop architecture.
+
+**Key decisions:**
+
+1. **Authentication handling:** The `query_api` tool needs `LMS_API_KEY` from `.env.docker.secret`, which is a different file from the LLM credentials. I extended `AgentSettings` to load both files and added a fallback mechanism using `dotenv`.
+
+2. **Environment variable flexibility:** The agent reads `AGENT_API_BASE_URL` from environment with a sensible default (`http://localhost:42002`). This allows the autochecker to inject different URLs during evaluation.
+
+3. **Tool selection guidance:** The system prompt was updated to clearly distinguish when the LLM should use `query_api` (live data, API behavior) vs `read_file`/`list_files` (wiki, source code). This distinction is crucial for the LLM to choose the right tool.
+
+4. **Error handling:** The `query_api` tool returns structured JSON even on errors (e.g., connection failures, timeouts), so the LLM can reason about API errors and potentially retry or report the issue.
+
+### Benchmark Performance
+
+*To be filled after running `uv run run_eval.py`.*
+
+### Troubleshooting Task 3
+
+| Issue | Solution |
+|-------|----------|
+| `query_api` returns connection error | Ensure Docker containers are running: `docker-compose ps` |
+| Agent uses wrong tool for data questions | Improve system prompt to clarify tool selection |
+| API returns 401 Unauthorized | Check `LMS_API_KEY` matches backend configuration |
+| Agent times out on multi-step questions | Reduce max iterations or optimize tool descriptions |
 
 ## Troubleshooting
 

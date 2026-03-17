@@ -11,6 +11,7 @@ Output:
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,20 +21,23 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class AgentSettings(BaseSettings):
-    """Settings loaded from .env.agent.secret."""
+    """Settings loaded from .env.agent.secret and .env.docker.secret."""
 
     model_config = SettingsConfigDict(
         env_file=".env.agent.secret",
         env_file_encoding="utf-8",
+        extra="allow",
     )
 
     llm_api_key: str
     llm_api_base: str
     llm_model: str = "qwen3-coder-plus"
+    lms_api_key: str | None = None
+    agent_api_base_url: str = "http://localhost:42002"
 
 
 def load_settings() -> AgentSettings:
-    """Load and validate agent settings from environment file."""
+    """Load and validate agent settings from environment files."""
     env_file = Path(".env.agent.secret")
     if not env_file.exists():
         print("Error: .env.agent.secret file not found", file=sys.stderr)
@@ -45,6 +49,19 @@ def load_settings() -> AgentSettings:
 
     try:
         settings = AgentSettings()
+
+        # Load LMS_API_KEY from .env.docker.secret if not in environment
+        if settings.lms_api_key is None:
+            docker_env_file = Path(".env.docker.secret")
+            if docker_env_file.exists():
+                import dotenv
+                dotenv.load_dotenv(docker_env_file)
+                settings.lms_api_key = os.getenv("LMS_API_KEY")
+
+        if settings.lms_api_key is None:
+            print("Warning: LMS_API_KEY not found. query_api tool may fail.", file=sys.stderr)
+            settings.lms_api_key = ""
+
         return settings
     except Exception as e:
         print(f"Error loading settings: {e}", file=sys.stderr)
@@ -162,33 +179,127 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Send an HTTP request to the backend LMS API. Use this to query live data (e.g., item count, completion rates, top learners) or check API behavior (status codes, error responses).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method: GET, POST, PUT, DELETE, etc."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API endpoint path (e.g., '/items/', '/analytics/completion-rate')"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST/PUT requests"
+                    }
+                },
+                "required": ["method", "path"],
+            },
+        },
+    },
 ]
 
 # System prompt for the documentation agent
-SYSTEM_PROMPT = """You are a documentation assistant for a software engineering lab.
+SYSTEM_PROMPT = """You are a documentation and system assistant for a software engineering lab.
 
-You have access to tools that let you read files and list directories in a project repository.
+You have access to tools that let you:
+1. Read files and list directories in the project repository (wiki/, backend/, etc.)
+2. Query the live backend API for data and system behavior
 
-When asked a question:
-1. Use list_files to explore the wiki/ directory to find relevant documentation
-2. Use read_file to read the contents of relevant wiki pages
-3. Find the answer to the user's question
-4. Include the source reference in your final answer (file path + section anchor if applicable)
+Tool selection guide:
+- Use `read_file` and `list_files` for:
+  - Wiki documentation questions
+  - Source code analysis (framework, ports, bug diagnosis)
+  - Configuration files (docker-compose.yml, Dockerfile, etc.)
 
-For example, if you find the answer in wiki/git-workflow.md under the "Resolving Merge Conflicts" section,
-the source should be: wiki/git-workflow.md#resolving-merge-conflicts
+- Use `query_api` for:
+  - Data queries (how many items, top learners, completion rates)
+  - API behavior questions (status codes, error responses)
+  - Live system state
+
+When answering:
+1. Identify what kind of question is asked (wiki, source code, or live data)
+2. Choose the appropriate tool(s)
+3. For bug diagnosis: first query the API to see the error, then read the source code
+4. Include source references for wiki/code answers (file path + section anchor if applicable)
+5. For API queries, report the actual response data
 
 Maximum 10 tool calls allowed. After that, provide the best answer you have found so far.
 """
 
 
-def execute_tool(tool_name: str, args: dict[str, Any]) -> str:
+def tool_query_api(method: str, path: str, body: str | None = None, settings: AgentSettings | None = None) -> str:
+    """
+    Send an HTTP request to the backend LMS API.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE, etc.)
+        path: API endpoint path (e.g., '/items/', '/analytics/completion-rate')
+        body: Optional JSON request body for POST/PUT requests
+        settings: Agent settings with LMS_API_KEY and AGENT_API_BASE_URL
+
+    Returns:
+        JSON string with status_code and response body, or error message.
+    """
+    if settings is None:
+        return "Error: Settings not provided"
+
+    base_url = settings.agent_api_base_url.rstrip("/")
+    url = f"{base_url}{path}"
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    # Add authentication header (Bearer token)
+    if settings.lms_api_key:
+        headers["Authorization"] = f"Bearer {settings.lms_api_key}"
+
+    print(f"  Executing query_api({method!r}, {path!r})", file=sys.stderr)
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                response = client.post(url, headers=headers, content=body or "{}")
+            elif method.upper() == "PUT":
+                response = client.put(url, headers=headers, content=body or "{}")
+            elif method.upper() == "DELETE":
+                response = client.delete(url, headers=headers)
+            else:
+                return f"Error: Unsupported HTTP method: {method}"
+
+            # Return structured response
+            result = {
+                "status_code": response.status_code,
+                "body": response.text,
+            }
+            return json.dumps(result)
+
+    except httpx.TimeoutException:
+        return json.dumps({"status_code": 0, "body": "Error: Request timed out"})
+    except httpx.ConnectError as e:
+        return json.dumps({"status_code": 0, "body": f"Error: Failed to connect to {url}: {e}"})
+    except Exception as e:
+        return json.dumps({"status_code": 0, "body": f"Error: {e}"})
+
+
+def execute_tool(tool_name: str, args: dict[str, Any], settings: AgentSettings | None = None) -> str:
     """
     Execute a tool call and return the result.
 
     Args:
         tool_name: Name of the tool to execute
         args: Arguments for the tool
+        settings: Agent settings (required for query_api)
 
     Returns:
         Tool result as string
@@ -202,6 +313,12 @@ def execute_tool(tool_name: str, args: dict[str, Any]) -> str:
         path = args.get("path", "")
         print(f"  Executing list_files({path!r})", file=sys.stderr)
         return tool_list_files(path)
+
+    elif tool_name == "query_api":
+        method = args.get("method", "GET")
+        path = args.get("path", "")
+        body = args.get("body")
+        return tool_query_api(method, path, body, settings)
 
     else:
         return f"Error: Unknown tool: {tool_name}"
@@ -334,7 +451,7 @@ def run_agentic_loop(question: str, settings: AgentSettings) -> dict[str, Any]:
             tool_calls_log.append(tool_call_entry)
 
             # Execute the tool
-            result = execute_tool(tool_name, args)
+            result = execute_tool(tool_name, args, settings)
             tool_call_entry["result"] = result
 
             # Add tool result to messages
