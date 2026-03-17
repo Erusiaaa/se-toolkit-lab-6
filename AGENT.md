@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the architecture of the LLM agent built for this lab. The agent is a CLI program that connects to an LLM API and returns structured JSON answers.
+This document describes the architecture of the LLM agent built for this lab. The agent is a CLI program that connects to an LLM API, uses tools to gather information, and returns structured JSON answers with source references.
 
 ## LLM Provider
 
@@ -12,7 +12,7 @@ This document describes the architecture of the LLM agent built for this lab. Th
 - 1000 free requests per day — sufficient for development and testing
 - Works from Russia without restrictions
 - No credit card required
-- OpenAI-compatible API — easy integration
+- OpenAI-compatible API with function calling support
 - Strong performance on coding and reasoning tasks
 
 **Model:** `qwen3-coder-plus`
@@ -20,7 +20,7 @@ This document describes the architecture of the LLM agent built for this lab. Th
 **Configuration:**
 - API Base: `http://10.93.25.146:8000/v1`
 - API Key: Stored in `.env.agent.secret`
-- Timeout: 60 seconds
+- Timeout: 60 seconds per request
 
 ## Architecture
 
@@ -28,37 +28,173 @@ This document describes the architecture of the LLM agent built for this lab. Th
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  CLI Interface  │ ──→ │  LLM Client     │ ──→ │  Output Formatter│
-│  (arg parsing)  │     │  (httpx call)   │     │  (JSON output)   │
+│  CLI Interface  │ ──→ │  Agentic Loop   │ ──→ │  Output Formatter│
+│  (arg parsing)  │     │  (tool executor)│     │  (JSON output)   │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
-         ↓                       ↓
-┌─────────────────┐     ┌─────────────────┐
-│  Settings       │     │  Error Handler  │
-│  (pydantic)     │     │  (stderr logs)  │
-└─────────────────┘     └─────────────────┘
+         ↓                       ↓                       ↓
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Settings       │     │  Tool Registry  │     │  Source Extractor│
+│  (pydantic)     │     │  (read, list)   │     │  (path parsing)  │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
 ```
 
-### Data Flow
+### Agentic Loop
 
-1. **Input:** User provides a question as a command-line argument
-2. **Settings Load:** Agent reads `.env.agent.secret` using `pydantic-settings`
-3. **API Call:** Agent sends HTTP POST request to LLM API using `httpx`
-4. **Response Parse:** Agent extracts answer from JSON response
-5. **Output:** Agent prints JSON `{"answer": "...", "tool_calls": []}` to stdout
+The agent follows an iterative loop:
 
-### File Structure
+1. **Build messages** — System prompt + user question + conversation history
+2. **Call LLM** — Send messages with tool definitions
+3. **Check response** — Does the LLM want to call tools?
+   - **Yes** → Execute tools, append results, go to step 1
+   - **No** → Extract final answer, go to step 4
+4. **Output JSON** — Return answer, source, and tool_calls
 
 ```
-project-root/
-├── agent.py              # Main CLI script
-├── .env.agent.secret     # LLM credentials (gitignored)
-├── .env.agent.example    # Example environment file
-├── AGENT.md              # This documentation
-├── plans/
-│   └── task-1.md         # Implementation plan
-└── tests/
-    └── test_task1_agent.py  # Regression test
+┌─────────────────────────────────────────────────────────────────┐
+│  1. messages = [system, user_question]                          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  2. response = LLM(messages, tools)                             │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │ tool_calls?     │
+                    └─────────────────┘
+                         │        │
+                       yes       no
+                         │        │
+                         ▼        │
+              ┌───────────────────┴──────────────┐
+              │                                  │
+              ▼                                  ▼
+    ┌───────────────────┐              ┌───────────────────┐
+    │ 3. Execute tools  │              │ 4. Extract answer │
+    │    - read_file    │              │    - source       │
+    │    - list_files   │              │    - tool_calls   │
+    └───────────────────┘              └───────────────────┘
+              │                                  │
+              ▼                                  │
+    ┌───────────────────┐                        │
+    │ Append tool       │                        │
+    │ results to        │                        │
+    │ messages          │                        │
+    └───────────────────┘                        │
+              │                                  │
+              └──────────────┬───────────────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ iteration < 10? │
+                    └─────────────────┘
+                         │        │
+                       yes       no
+                         │        │
+                         ▼        │
+              ┌───────────────────┘
+              │ (back to step 2)
+              │
+              ▼
+    ┌───────────────────┐
+    │ 5. Output JSON    │
+    └───────────────────┘
 ```
+
+### Tools
+
+The agent has two tools registered as function-calling schemas:
+
+#### `read_file`
+
+Read the contents of a file from the project repository.
+
+**Parameters:**
+- `path` (string): Relative path from project root (e.g., `wiki/git-workflow.md`)
+
+**Returns:** File contents as string, or error message.
+
+**Security:**
+- Validates path is within project directory
+- Blocks `..` traversal attempts
+- Returns error for paths outside project root
+
+#### `list_files`
+
+List files and directories at the given path.
+
+**Parameters:**
+- `path` (string): Relative directory path from project root (e.g., `wiki`)
+
+**Returns:** Newline-separated listing, or error message.
+
+**Security:**
+- Validates path is within project directory
+- Blocks `..` traversal attempts
+
+### Path Security
+
+```python
+def safe_path(user_path: str) -> Path | None:
+    """Validate path is within project root."""
+    project_root = get_project_root()
+    requested_path = (project_root / user_path).resolve()
+    try:
+        requested_path.relative_to(project_root)
+        return requested_path
+    except ValueError:
+        return None  # Path is outside project root
+```
+
+### System Prompt
+
+The system prompt instructs the LLM to:
+
+1. Use `list_files` to explore the `wiki/` directory
+2. Use `read_file` to read relevant wiki pages
+3. Find the answer and include the source reference
+4. Stop after 10 tool calls maximum
+
+```
+You are a documentation assistant for a software engineering lab.
+
+You have access to tools that let you read files and list directories in a project repository.
+
+When asked a question:
+1. Use list_files to explore the wiki/ directory to find relevant documentation
+2. Use read_file to read the contents of relevant wiki pages
+3. Find the answer to the user's question
+4. Include the source reference in your final answer (file path + section anchor if applicable)
+
+Maximum 10 tool calls allowed.
+```
+
+### Output Format
+
+```json
+{
+  "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
+  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "tool_calls": [
+    {
+      "tool": "list_files",
+      "args": {"path": "wiki"},
+      "result": "git-workflow.md\nREADME.md\n..."
+    },
+    {
+      "tool": "read_file",
+      "args": {"path": "wiki/git-workflow.md"},
+      "result": "# Git Workflow\n\n## Resolving Merge Conflicts\n..."
+    }
+  ]
+}
+```
+
+**Fields:**
+- `answer` (string): The final answer from the LLM
+- `source` (string): Wiki file path with optional section anchor
+- `tool_calls` (array): All tool calls made during the loop
 
 ## How to Run
 
@@ -74,20 +210,27 @@ project-root/
 ### Basic Usage
 
 ```bash
-uv run agent.py "What does REST stand for?"
+uv run agent.py "How do you resolve a merge conflict?"
 ```
 
 ### Expected Output
 
 ```json
-{"answer": "Representational State Transfer.", "tool_calls": []}
+{
+  "answer": "...",
+  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "tool_calls": [...]
+}
 ```
 
 ### Running Tests
 
 ```bash
-# Run the Task 1 test
-pytest tests/test_task1_agent.py -v
+# Run Task 2 tests
+pytest tests/test_task2_agent.py -v
+
+# Run all tests
+pytest tests/ -v
 ```
 
 ## Environment Variables
@@ -100,8 +243,6 @@ pytest tests/test_task1_agent.py -v
 
 ## Error Handling
 
-The agent handles the following error cases:
-
 | Error | Behavior |
 |-------|----------|
 | Missing `.env.agent.secret` | Exit with error message to stderr |
@@ -109,18 +250,9 @@ The agent handles the following error cases:
 | Network timeout (>60s) | Exit with timeout error |
 | HTTP error (4xx, 5xx) | Print status code and response to stderr |
 | Invalid API response | Print parsing error to stderr |
-
-## Output Format
-
-**stdout:** Single JSON line with:
-- `answer` (string): The LLM's response
-- `tool_calls` (array): Empty for Task 1 (populated in Task 2)
-
-**stderr:** All debug and error messages
-
-**Exit codes:**
-- `0`: Success
-- `1`: Error (missing args, API error, timeout, etc.)
+| Path traversal attempt | Return "Access denied" as tool result |
+| File not found | Return "File not found" as tool result |
+| Max 10 tool calls | Stop loop, return partial answer |
 
 ## Dependencies
 
@@ -128,14 +260,21 @@ The agent handles the following error cases:
 - `pydantic-settings` — Environment variable loading and validation
 - `pytest` — Testing framework
 
-## Future Extensions (Tasks 2–3)
+## File Structure
 
-In subsequent tasks, the agent will be extended with:
-
-1. **Tools:** Functions the agent can call (e.g., `read_file`, `query_api`)
-2. **Agentic Loop:** Repeated reasoning and tool usage until task completion
-3. **System Prompt:** Enhanced instructions for tool usage and behavior
-4. **Tool Call Tracking:** Populate `tool_calls` array in output
+```
+project-root/
+├── agent.py              # Main CLI script
+├── .env.agent.secret     # LLM credentials (gitignored)
+├── .env.agent.example    # Example environment file
+├── AGENT.md              # This documentation
+├── plans/
+│   ├── task-1.md         # Task 1 implementation plan
+│   └── task-2.md         # Task 2 implementation plan
+└── tests/
+    ├── test_task1_agent.py  # Task 1 regression test
+    └── test_task2_agent.py  # Task 2 regression tests
+```
 
 ## Troubleshooting
 
@@ -148,6 +287,10 @@ In subsequent tasks, the agent will be extended with:
 - Check that `LLM_API_KEY` matches the key in your VM's `~/qwen-code-oai-proxy/.env`
 - Ensure no extra spaces or quotes in the value
 
-### Timeout errors
-- Check network connectivity to your VM
-- The model may be slow during peak usage — try again
+### Agent doesn't find the answer
+- Check that the wiki directory contains relevant documentation
+- The LLM may need more iterations — check stderr for tool call logs
+
+### Tool calls return "Access denied"
+- Ensure the path is relative to project root
+- Don't use `../` or absolute paths
